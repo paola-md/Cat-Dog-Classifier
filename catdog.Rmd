@@ -1,0 +1,201 @@
+---
+title: "Cat Dog Classifier"
+output:
+  html_document:
+    df_print: paged
+---
+
+```{r}
+library(keras)
+is_keras_available()
+```
+
+
+### File locations and settings
+```{r}
+train_directory <- "/Users/pmejiad/Datos/train"
+validation_directory <- "/Users/pmejiad/Datos/validation"
+img_width <- 80
+img_height <- 80
+batch_size <- 60
+epochs <- 20
+train_samples = 13200
+validation_samples = 7740
+```
+
+
+## Using a pre-trained model
+
+This project uses VGG16 (model trained on the ImageNet dataset) and a multi-layer perceptron on top
+
+https://www.researchgate.net/figure/A-schematic-of-the-VGG-16-Deep-Convolutional-Neural-Network-DCNN-architecture-trained_fig2_319952138
+
+```{r}
+model_vgg <- application_vgg16(include_top = FALSE, weights = "imagenet")
+```
+
+### Process images
+Generates batches of data from images in a directory (with optional augmented/normalized data)
+
+https://www.rdocumentation.org/packages/keras/versions/2.2.4/topics/flow_images_from_directory
+
+```{r}
+train_generator_bottleneck <- flow_images_from_directory(
+        train_directory,
+        target_size= c(img_height, img_width),
+        batch_size=batch_size,
+        class_mode=NULL,
+        shuffle=FALSE)
+
+validation_generator_bottleneck <- flow_images_from_directory(
+        validation_directory,
+        target_size= c(img_height, img_width),
+        batch_size=batch_size,
+        class_mode=NULL,
+        shuffle=FALSE)
+```
+
+#Save model  
+```{r}
+bottleneck_features_train <- predict_generator(model_vgg,
+                                               train_generator_bottleneck, 
+                                               train_samples / batch_size)
+
+saveRDS(bottleneck_features_train, "/Users/pmejiad/Datos/bottleneck_features_train.rds")
+
+
+bottleneck_features_validation <- predict_generator(model_vgg,
+                                                    validation_generator_bottleneck,
+                                                    validation_samples / batch_size)
+
+saveRDS(bottleneck_features_validation, "/Users/pmejiad/Datos/bottleneck_features_validation.rds")
+```
+
+#Load model
+```{r}
+bottleneck_features_train <- readRDS("/Users/pmejiad/Datos/bottleneck_features_train.rds")
+bottleneck_features_validation <- readRDS("/Users/pmejiad/Datos/bottleneck_features_validation.rds")
+
+train_labels = c(rep(0,train_samples/2),rep(1,train_samples/2))
+validation_labels = c(rep(0,validation_samples/2),rep(1,validation_samples/2))
+```
+
+
+## Fine-tuning the top layers of a a pre-trained network
+VGG is the base using the weights from imagenet
+
+```{r}
+model_vgg <- application_vgg16(include_top = FALSE, weights = "imagenet",
+                               input_shape = c(as.integer(img_height), 
+                                as.integer(img_width), as.integer(3))                              )
+```
+
+
+#top_model goes on top of the pre-trained model. 
+
+```{r}
+top_model <- keras_model_sequential()
+top_model %>%
+  layer_dense(units=nrow(bottleneck_features_train),input_shape = model_vgg$output_shape[2:4]) %>% 
+  layer_flatten() %>%
+  layer_dense(256) %>%
+  layer_activation("relu") %>%
+  layer_dropout(0.5) %>%
+  layer_dense(1) %>%
+  layer_activation("sigmoid")
+
+load_model_weights_hdf5(top_model, "/Users/pmejiad/Datos/bottleneck_30_epochsR.h5")
+
+model_ft <- keras_model(inputs = model_vgg$input, 
+                        outputs = top_model(model_vgg$output))
+```
+
+The first 16 layers (arbitrary number) will not be trained
+
+```{r}
+for (layer in model_ft$layers[1:15])
+ layer$trainable <- FALSE
+```
+
+
+SGD/momentum optimizer is used to compile the model (slow)
+```{r}
+model_ft %>% compile(
+  loss = "binary_crossentropy",
+  optimizer = optimizer_sgd(lr=1e-3, momentum=0.9),
+  metrics = "accuracy")
+```
+
+```{r}
+augment <- image_data_generator(rescale=1./255,
+                               shear_range=0.2,
+                               zoom_range=0.2,
+                               horizontal_flip=TRUE)
+
+train_generator_augmented <- flow_images_from_directory(train_directory, 
+                                                        generator = augment,
+                                                        target_size = c(img_height, img_width),
+                                                        color_mode = "rgb",
+                                                        class_mode = "binary", 
+                                                        batch_size = batch_size, 
+                                                        shuffle = TRUE,
+                                                        seed = 123)
+
+validation_generator <- flow_images_from_directory(validation_directory, 
+                                                   generator = image_data_generator(rescale=1./255),
+                                                   target_size = c(img_height, img_width),
+                                                   color_mode = "rgb", 
+                                                   classes = NULL,
+                                                   class_mode = "binary", 
+                                                   batch_size = batch_size, 
+                                                   shuffle = TRUE,
+                                                   seed = 123)
+```
+
+Fine-tune the model
+```{r}
+model_ft %>% fit_generator(
+  train_generator_augmented,
+  steps_per_epoch = as.integer(train_samples/batch_size), 
+  epochs = 10, 
+  validation_data = validation_generator,
+  validation_steps = as.integer(validation_samples/batch_size)
+  ,verbose=2  #Needed when using restudio server
+  )
+```
+
+
+```{r}
+save_model_weights_hdf5(model_ft, '/Users/pmejiad/Datos/finetuning_10epochs_vggR_2.h5', overwrite = TRUE)
+load_model_weights_hdf5(model_ft, '/Users/pmejiad/Datos/finetuning_10epochs_vggR_2.h5')
+```
+
+### Generation predictions
+
+```{r}
+
+test_image_files_path <- '/Users/pmejiad/Datos/test'
+
+prueba <- image_data_generator(rescale = 1/255)
+
+
+#You need to reset the test_generator before whenever you call the predict_generator. This is important, if you forget to reset the test_generator you will get outputs in a weird order. 
+
+ancho <- 80
+alto <- 80
+tamano <- c(ancho, alto)
+
+test <- flow_images_from_directory( test_image_files_path,
+                                   prueba, 
+                                   target_size = tamano,
+                                   color_mode = 'rgb', #rgb
+                                   batch_size=1, #Set this to a number that divides your total number of images in your test set exactly.
+                                   shuffle=FALSE, # False because you need to yield the images in “order”, to predict the outputs and match them with their unique ids or filenames. Para que mantenga como el mismo orden en la lectura de las imágenes
+                                   seed=42711)
+test$n 
+predicciones <- predict_generator(model_ft, test, steps=test$n, verbose=1) 
+#verbose=1 allows prediction progress to be visualized
+
+predicciones_res <- data.frame(indice=seq(1:test$n), probabilidad=predicciones)
+write.csv(predicciones_res, '/Users/pmejiad/Datos/predicciones.csv', row.names = FALSE)
+```
